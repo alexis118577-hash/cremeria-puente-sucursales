@@ -1174,6 +1174,50 @@ function handleBranchRelayQuery(request, acknowledge) {
   }
 }
 
+function handleBranchRelayCommand(command, acknowledge) {
+  if (typeof acknowledge !== 'function') return;
+  try {
+    if (!command || command.type !== 'inventory:restock') {
+      const error = new Error('El puente solo acepta órdenes de reabastecimiento en vivo.');
+      error.status = 400;
+      throw error;
+    }
+    const db = readDb();
+    const branchCode = normalizeMirrorBranchCode(getBranchProfile(db).code || '');
+    const requestedCode = normalizeMirrorBranchCode(command.branchCode || '');
+    if (!branchCode || branchCode !== requestedCode) {
+      const error = new Error('La orden no corresponde al código de esta sucursal.');
+      error.status = 409;
+      throw error;
+    }
+    if (getRemotePermissions(db).writeInventory === false) {
+      const error = new Error('Esta sucursal no permite reabastecimientos remotos.');
+      error.status = 403;
+      throw error;
+    }
+
+    const payload = command.payload || {};
+    if (String(command.requestId || '') !== String(payload.idempotencyKey || '')) {
+      const error = new Error('El identificador de la orden remota no coincide.');
+      error.status = 400;
+      throw error;
+    }
+    const result = commitRestockTransaction(db, payload, {
+      sourceType: 'REMOTE_ADMIN_RESTOCK',
+      userId: String(payload.actorUserId || '').slice(0, 160),
+      userName: String(payload.actorName || 'Administrador de sucursal principal').slice(0, 160),
+      username: String(payload.actorUsername || 'remote-admin').slice(0, 120),
+      branchName: String(payload.actorBranch || 'Sucursal principal').slice(0, 120)
+    });
+    if (!result.alreadyRegistered) {
+      broadcastRestockCommit(db, result, payload.idempotencyKey, payload.terminalCode || 'REMOTE-ADMIN');
+    }
+    acknowledge({ ok: true, payload: result });
+  } catch (err) {
+    acknowledge({ ok: false, status: err.status || 500, code: err.code || '', message: err.message || 'No se pudo aplicar el reabastecimiento remoto.' });
+  }
+}
+
 function configureBranchRelayClient(db = null) {
   if (RENDER_MIRROR_ONLY) return { ok: false, message: 'El conector de sucursal no se inicia en el servicio Render.' };
   const sourceDb = db || readDb();
@@ -1248,6 +1292,7 @@ function configureBranchRelayClient(db = null) {
     branchRelayClientStatus = { connected: false, status: 'CONNECTING', lastError: err.message || 'Sin conexión' };
   });
   branchRelayClient.on('branch:query', handleBranchRelayQuery);
+  branchRelayClient.on('branch:command', handleBranchRelayCommand);
   return { ok: true, connected: false, client: branchRelayClient };
 }
 
@@ -3793,10 +3838,10 @@ function relayRemoteRead(req, res, remoteAuth, endpoint) {
       return res.status(result?.status || 502).json({ ok: false, message: result?.message || 'No se pudo leer la información de la sucursal.' });
     }
     result.payload.authMode = remoteAuth.authMode;
-    const readOnlyPermissions = { ...(result.payload.permissions || remoteAuth.permissions), writeInventory: false, syncBridge: false };
-    result.payload.permissions = readOnlyPermissions;
+    const branchPermissions = { ...(result.payload.permissions || remoteAuth.permissions), syncBridge: false };
+    result.payload.permissions = branchPermissions;
     if (result.payload.remote && typeof result.payload.remote === 'object') {
-      result.payload.remote.permissions = readOnlyPermissions;
+      result.payload.remote.permissions = branchPermissions;
     }
     return res.json(result.payload);
     });
@@ -3824,6 +3869,57 @@ function relayRemoteRead(req, res, remoteAuth, endpoint) {
   const waiters = branchRelayConnectionWaiters.get(branchCode) || [];
   waiters.push(waiter);
   branchRelayConnectionWaiters.set(branchCode, waiters);
+}
+
+function relayRemoteRestock(req, res, remoteAuth) {
+  const requestedCode = String(req.headers['x-remote-branch-code'] || '').trim();
+  const branchCode = normalizeMirrorBranchCode(requestedCode);
+  if (!branchCode) return res.status(400).json({ ok: false, message: 'Indica un código de sucursal válido para el reabastecimiento.' });
+
+  const socket = activeBranchRelays.get(branchCode);
+  if (!socket?.connected) {
+    return res.status(503).json({ ok: false, code: 'BRANCH_OFFLINE', message: `La sucursal ${branchCode} no está conectada al puente. No se envió ni guardó ninguna orden.` });
+  }
+
+  const request = req.body || {};
+  const payload = {
+    productId: String(request.productId || '').slice(0, 160),
+    quantity: request.quantity,
+    expectedUnitCost: request.expectedUnitCost,
+    idempotencyKey: String(request.idempotencyKey || '').slice(0, 160),
+    reason: String(request.reason || 'Reabastecimiento remoto desde sucursal principal').slice(0, 240),
+    notes: String(request.notes || '').slice(0, 500),
+    terminalCode: String(request.terminalCode || 'REMOTE-ADMIN').slice(0, 80),
+    actorName: String(request.actorName || 'Administrador de sucursal principal').slice(0, 160),
+    actorUsername: String(request.actorUsername || 'remote-admin').slice(0, 120),
+    actorUserId: String(request.actorUserId || '').slice(0, 160),
+    actorBranch: String(request.actorBranch || 'Sucursal principal').slice(0, 120)
+  };
+  if (!payload.productId || !payload.idempotencyKey) {
+    return res.status(400).json({ ok: false, message: 'Faltan el producto o el identificador único del reabastecimiento.' });
+  }
+
+  // El comando solo vive en esta solicitud y en el socket activo; nunca se encola ni se persiste en Render.
+  socket.timeout(110000).emit('branch:command', {
+    branchCode,
+    type: 'inventory:restock',
+    requestId: payload.idempotencyKey,
+    payload
+  }, (timeoutError, result) => {
+    if (timeoutError) {
+      return res.status(504).json({
+        ok: false,
+        code: 'REMOTE_COMMAND_UNCONFIRMED',
+        outcomeUnknown: true,
+        message: `La sucursal ${branchCode} no confirmó el resultado a tiempo. Conserva la misma cantidad y vuelve a consultar con el mismo identificador para evitar duplicados.`
+      });
+    }
+    if (!result?.ok || !result.payload) {
+      return res.status(result?.status || 502).json({ ok: false, code: result?.code || '', message: result?.message || 'La sucursal destino no pudo aplicar el reabastecimiento.' });
+    }
+    result.payload.authMode = remoteAuth.authMode;
+    return res.json(result.payload);
+  });
 }
 
 function auth(req, _res, next) {
@@ -3875,6 +3971,7 @@ app.get('/health', (_req, res) => {
   res.json({
     ok: true,
     service: RENDER_MIRROR_ONLY ? 'branch-live-relay' : 'embedded-lan-backend',
+    version: require('./package.json').version,
     port: PORT,
     adminName: ADMIN_NAME,
     hostname: os.hostname(),
@@ -4168,6 +4265,38 @@ app.get('/api/remote/alerts', (req, res) => {
   const payload = getEffectiveRemoteStockAlerts(db, context.branchCode);
   payload.authMode = remoteAuth.authMode;
   return res.json(payload);
+});
+
+app.post('/api/remote/inventory/restock', (req, res) => {
+  const db = readDb();
+  // Render solo valida la llave y reenvía el comando en vivo. La autorización de escritura
+  // se comprueba de nuevo en la PC destino, que es la única que modifica su base local.
+  const remoteAuth = authorizeRemoteRequest(req, res, db, RENDER_MIRROR_ONLY ? 'readInventory' : 'writeInventory');
+  if (!remoteAuth) return;
+
+  if (RENDER_MIRROR_ONLY) return relayRemoteRestock(req, res, remoteAuth);
+
+  const requestedCode = String(req.headers['x-remote-branch-code'] || '').trim();
+  const branchCode = normalizeMirrorBranchCode(requestedCode);
+  const localCode = normalizeMirrorBranchCode(getBranchProfile(db).code || '');
+  if (!branchCode || branchCode !== localCode) {
+    return res.status(409).json({ ok: false, message: 'El código de sucursal no coincide con esta computadora.' });
+  }
+  try {
+    const request = req.body || {};
+    const result = commitRestockTransaction(db, request, {
+      sourceType: 'REMOTE_ADMIN_RESTOCK',
+      userId: String(request.actorUserId || '').slice(0, 160),
+      userName: String(request.actorName || 'Administrador de sucursal principal').slice(0, 160),
+      actorName: String(request.actorName || 'Administrador de sucursal principal').slice(0, 160),
+      actorUsername: String(request.actorUsername || 'remote-admin').slice(0, 120),
+      branchName: String(request.actorBranch || 'Sucursal principal').slice(0, 120)
+    });
+    if (!result.alreadyRegistered) broadcastRestockCommit(db, result, request.idempotencyKey, request.terminalCode || 'REMOTE-ADMIN');
+    return res.json(result);
+  } catch (err) {
+    return res.status(err.status || 400).json({ ok: false, code: err.code || '', message: err.message || 'No se pudo reabastecer el producto.' });
+  }
 });
 
 app.post('/api/remote/inventory/adjust', (req, res) => {
@@ -4532,158 +4661,240 @@ app.post('/api/products/clear', auth, requireAdmin, (_req, res) => {
   res.json({ ok: true, deleted: result.deleted, productIds: result.removedIds });
 });
 
-app.post('/api/products/restock', auth, requireAdmin, (req, res) => {
-  const db = req.dataDb13650 || readDb();
-  try {
-    ensureCashCollections(db);
-    db.inventoryAdjustments = Array.isArray(db.inventoryAdjustments) ? db.inventoryAdjustments : [];
-    db.auditLog = Array.isArray(db.auditLog) ? db.auditLog : [];
-    db.counters = { ...(db.counters || {}) };
-    const product = (db.products || []).find((row) => row.id === req.body?.productId);
-    if (!product) return res.status(404).json({ ok: false, message: 'Producto existente no encontrado.' });
+function makeRestockError13657(status, message, code = '') {
+  const error = new Error(message);
+  error.status = status;
+  if (code) error.code = code;
+  return error;
+}
 
-    const idempotencyKey = String(req.body?.idempotencyKey || '').trim();
-    if (!idempotencyKey || idempotencyKey.length > 160) {
-      return res.status(400).json({ ok: false, message: 'No se recibió un identificador único para el Restock. Actualiza la aplicación y vuelve a intentarlo.' });
-    }
-    const priorMovement = db.inventoryAdjustments.find((entry) => entry.idempotencyKey === idempotencyKey);
-    const priorCashEntry = db.cashEntries.find((entry) => entry.idempotencyKey === idempotencyKey);
-    if (priorMovement || priorCashEntry) {
-      if (!priorMovement || !priorCashEntry) {
-        return res.status(409).json({ ok: false, code: 'RESTOCK_INCOMPLETE', message: 'El Restock tiene un registro incompleto y requiere revisión administrativa. No se volvió a aplicar.' });
-      }
-      return res.json({
-        ok: true,
-        alreadyRegistered: true,
-        product,
-        movement: priorMovement,
-        cashEntry: priorCashEntry,
-        overview: buildCashOverview(db, normalizeDateKey(priorCashEntry.dateKey || priorCashEntry.createdAt))
-      });
-    }
+function commitRestockTransaction(db, request = {}, actor = {}) {
+  ensureCashCollections(db);
+  db.inventoryAdjustments = Array.isArray(db.inventoryAdjustments) ? db.inventoryAdjustments : [];
+  db.auditLog = Array.isArray(db.auditLog) ? db.auditLog : [];
+  db.counters = { ...(db.counters || {}) };
+  const sourceType = String(actor.sourceType || 'LOCAL_ADMIN_RESTOCK');
+  const remoteInventoryOnly = sourceType === 'REMOTE_ADMIN_RESTOCK';
+  const product = (db.products || []).find((row) => row.id === request.productId);
+  if (!product) throw makeRestockError13657(404, 'Producto existente no encontrado.');
 
-    const rawQuantity = Number(req.body?.quantity);
-    if (!Number.isFinite(rawQuantity) || rawQuantity <= 0) {
-      return res.status(400).json({ ok: false, message: 'La cantidad para Restock debe ser mayor a cero.' });
+  const idempotencyKey = String(request.idempotencyKey || '').trim();
+  if (!idempotencyKey || idempotencyKey.length > 160) {
+    throw makeRestockError13657(400, 'No se recibió un identificador único para el Restock. Actualiza la aplicación y vuelve a intentarlo.');
+  }
+  const priorMovement = db.inventoryAdjustments.find((entry) => entry.idempotencyKey === idempotencyKey);
+  const priorCashEntry = db.cashEntries.find((entry) => entry.idempotencyKey === idempotencyKey);
+  if (priorMovement || priorCashEntry) {
+    const validRemoteInventoryOnlyRetry = remoteInventoryOnly
+      && priorMovement?.sourceType === 'REMOTE_ADMIN_RESTOCK'
+      && !priorCashEntry;
+    if (!priorMovement || (!priorCashEntry && !validRemoteInventoryOnlyRetry)) {
+      throw makeRestockError13657(409, 'El Restock tiene un registro incompleto y requiere revisión administrativa. No se volvió a aplicar.', 'RESTOCK_INCOMPLETE');
     }
-    const quantity = roundQuantity(rawQuantity);
-    if (quantity <= 0 || (!product.allowsFraction && !Number.isInteger(quantity))) {
-      return res.status(400).json({ ok: false, message: product.allowsFraction
-        ? 'La cantidad debe ser mayor a cero y admite hasta tres decimales.'
-        : 'Este producto se maneja por pieza; captura una cantidad entera.' });
-    }
-    const rawUnitCost = Number(product.costPrice);
-    if (!Number.isFinite(rawUnitCost) || rawUnitCost <= 0) {
-      return res.status(409).json({ ok: false, code: 'ACQUISITION_COST_REQUIRED', message: 'Este producto no tiene un costo de adquisición válido. Captura o corrige su costo en Productos antes de hacer el Restock.' });
-    }
-    const unitCost = round2(rawUnitCost);
-    if (unitCost <= 0) {
-      return res.status(409).json({ ok: false, code: 'ACQUISITION_COST_REQUIRED', message: 'El costo de adquisición debe ser mayor a $0.00. Corrígelo antes de hacer el Restock.' });
-    }
-    const totalCost = round2(quantity * unitCost);
-    if (totalCost <= 0) return res.status(400).json({ ok: false, message: 'El importe del Restock debe ser mayor a cero.' });
-    const dateKey = normalizeDateKey();
-    const overviewBefore = buildCashOverview(db, dateKey);
-    if (overviewBefore.expectedCash + 0.0001 < totalCost) {
-      const shortage = round2(totalCost - overviewBefore.expectedCash);
-      return res.status(409).json({
-        ok: false,
-        code: 'INSUFFICIENT_CASH',
-        message: `Efectivo insuficiente para el Restock. Disponible: $${overviewBefore.expectedCash.toFixed(2)}; requerido: $${totalCost.toFixed(2)}; faltan: $${shortage.toFixed(2)}. Registra primero el fondo o ingreso autorizado de caja.`
-      });
-    }
-
-    const result = applyInventoryAdjustment(db, {
-      productId: product.id,
-      operation: 'add',
-      quantity,
-      reason: String(req.body?.reason || '').trim() || 'Restock de producto existente con egreso de efectivo',
-      type: 'restock',
-      sourceType: 'LOCAL_ADMIN_RESTOCK',
-      actorName: req.user?.name || 'Administrador local',
-      actorUsername: req.user?.username || 'admin',
-      actorBranch: ADMIN_NAME
-    });
-    const now = new Date().toISOString();
-    const restockSequence = safeNumber(db.counters.restockSequence, 0) + 1;
-    db.counters.restockSequence = restockSequence;
-    const restockId = uuidv4();
-    const cashEntry = {
-      id: uuidv4(),
-      restockId,
-      inventoryMovementId: result.movement.id,
-      idempotencyKey,
-      folio: `RST-${String(restockSequence).padStart(6, '0')}`,
-      kind: 'restock_purchase',
-      sourceType: 'LOCAL_ADMIN_RESTOCK',
-      dateKey,
-      productId: product.id,
-      productName: product.name,
-      quantity,
-      unit: product.unit || 'PZA',
-      unitCostSnapshot: unitCost,
-      totalCost,
-      accountingAmount: totalCost,
-      amountCashImpact: totalCost,
-      paymentMethod: 'cash',
-      paymentMethodLabel: 'Efectivo',
-      description: `Restock: ${product.name}`,
-      notes: String(req.body?.notes || '').trim(),
-      terminalCode: String(req.body?.terminalCode || 'ADMIN-01').trim(),
-      branchId: getBranchProfile(db).code || 'LOCAL',
-      userId: req.user?.id || '',
-      userName: req.user?.name || req.user?.username || '',
-      createdAt: now,
-      status: 'COMMITTED'
+    return {
+      ok: true,
+      alreadyRegistered: true,
+      product,
+      movement: priorMovement,
+      cashEntry: priorCashEntry || null,
+      cashImpact: safeNumber(priorCashEntry?.amountCashImpact, 0),
+      overview: buildCashOverview(db, normalizeDateKey(priorCashEntry?.dateKey || priorMovement.createdAt))
     };
+  }
+
+  const rawQuantity = Number(request.quantity);
+  if (!Number.isFinite(rawQuantity) || rawQuantity <= 0) {
+    throw makeRestockError13657(400, 'La cantidad para Restock debe ser mayor a cero.');
+  }
+  const quantity = roundQuantity(rawQuantity);
+  if (quantity <= 0 || (!product.allowsFraction && !Number.isInteger(quantity))) {
+    throw makeRestockError13657(400, product.allowsFraction
+      ? 'La cantidad debe ser mayor a cero y admite hasta tres decimales.'
+      : 'Este producto se maneja por pieza; captura una cantidad entera.');
+  }
+  const rawUnitCost = Number(product.costPrice);
+  if (!remoteInventoryOnly && (!Number.isFinite(rawUnitCost) || rawUnitCost <= 0)) {
+    throw makeRestockError13657(409, 'Este producto no tiene un costo de adquisición válido. Captura o corrige su costo en Productos antes de hacer el Restock.', 'ACQUISITION_COST_REQUIRED');
+  }
+  // Los reabastecimientos remotos solo mueven inventario y no afectan caja;
+  // por eso no deben depender de que el producto tenga costo de adquisición.
+  const unitCost = Number.isFinite(rawUnitCost) && rawUnitCost > 0 ? round2(rawUnitCost) : 0;
+  if (!remoteInventoryOnly && unitCost <= 0) {
+    throw makeRestockError13657(409, 'El costo de adquisición debe ser mayor a $0.00. Corrígelo antes de hacer el Restock.', 'ACQUISITION_COST_REQUIRED');
+  }
+  if (request.expectedUnitCost !== undefined && request.expectedUnitCost !== null) {
+    const expectedUnitCost = Number(request.expectedUnitCost);
+    if (!Number.isFinite(expectedUnitCost) || round2(expectedUnitCost) !== unitCost) {
+      throw makeRestockError13657(409, 'El costo de adquisición cambió en la sucursal destino. Actualiza el inventario y confirma nuevamente el importe.', 'ACQUISITION_COST_CHANGED');
+    }
+  }
+  const totalCost = round2(quantity * unitCost);
+  if (!remoteInventoryOnly && totalCost <= 0) throw makeRestockError13657(400, 'El importe del Restock debe ser mayor a cero.');
+  const dateKey = normalizeDateKey();
+  const overviewBefore = buildCashOverview(db, dateKey);
+  if (!remoteInventoryOnly && overviewBefore.expectedCash + 0.0001 < totalCost) {
+    const shortage = round2(totalCost - overviewBefore.expectedCash);
+    throw makeRestockError13657(409,
+      `Efectivo insuficiente para el Restock. Disponible: $${overviewBefore.expectedCash.toFixed(2)}; requerido: $${totalCost.toFixed(2)}; faltan: $${shortage.toFixed(2)}. Registra primero el fondo o ingreso autorizado de caja.`,
+      'INSUFFICIENT_CASH');
+  }
+
+  const actorName = String(actor.actorName || 'Administrador local');
+  const actorUsername = String(actor.actorUsername || 'admin');
+  const actorBranch = String(actor.branchName || ADMIN_NAME);
+  const userId = String(actor.userId || '');
+  const userName = String(actor.userName || actorName || actorUsername);
+  const result = applyInventoryAdjustment(db, {
+    productId: product.id,
+    operation: 'add',
+    quantity,
+    reason: String(request.reason || '').trim() || (remoteInventoryOnly
+      ? 'Reabastecimiento remoto desde sucursal principal sin movimiento de caja'
+      : 'Restock de producto existente con egreso de efectivo'),
+    type: 'restock',
+    sourceType,
+    actorName,
+    actorUsername,
+    actorBranch
+  });
+  const now = new Date().toISOString();
+  const restockSequence = safeNumber(db.counters.restockSequence, 0) + 1;
+  db.counters.restockSequence = restockSequence;
+  const restockId = uuidv4();
+  if (remoteInventoryOnly) {
     Object.assign(result.movement, {
       restockId,
       idempotencyKey,
       unitCostSnapshot: unitCost,
       totalCost,
-      cashEntryId: cashEntry.id,
+      cashImpact: 0,
       dateKey,
       status: 'COMMITTED'
     });
-    db.cashEntries.push(cashEntry);
     db.auditLog.unshift({
-      id: uuidv4(), action: 'RESTOCK_CASH_COMMITTED', restockId, idempotencyKey,
-      productId: product.id, productName: product.name, quantity, unit: product.unit || 'PZA',
-      unitCostSnapshot: unitCost, totalCost, inventoryMovementId: result.movement.id,
-      cashEntryId: cashEntry.id, branchId: cashEntry.branchId,
-      userId: req.user?.id || '', userName: req.user?.name || req.user?.username || '',
+      id: uuidv4(),
+      action: 'REMOTE_RESTOCK_INVENTORY_COMMITTED',
+      sourceType,
+      restockId,
+      idempotencyKey,
+      productId: product.id,
+      productName: product.name,
+      quantity,
+      unit: product.unit || 'PZA',
+      unitCostSnapshot: unitCost,
+      inventoryValueReference: totalCost,
+      cashImpact: 0,
+      inventoryMovementId: result.movement.id,
+      branchId: getBranchProfile(db).code || 'LOCAL',
+      userId,
+      userName,
       createdAt: now
     });
     db.auditLog = db.auditLog.slice(0, 10000);
     writeDb(db);
-    const overview = {
-      ...overviewBefore,
-      expensesCashImpactTotal: round2(overviewBefore.expensesCashImpactTotal + cashEntry.amountCashImpact),
-      restockTotal: round2(overviewBefore.restockTotal + totalCost),
-      restockCashOutflowTotal: round2(overviewBefore.restockCashOutflowTotal + cashEntry.amountCashImpact),
-      restockPurchases: [...overviewBefore.restockPurchases, cashEntry],
-      accountingOutflowTotal: round2(overviewBefore.accountingOutflowTotal + totalCost),
-      expectedCash: round2(overviewBefore.expectedCash - cashEntry.amountCashImpact),
-      entries: [...overviewBefore.entries, cashEntry]
+    return {
+      ok: true,
+      alreadyRegistered: false,
+      inventoryOnly: true,
+      cashImpact: 0,
+      product: result.product,
+      movement: result.movement,
+      cashEntry: null,
+      overview: overviewBefore
     };
-    res.json({ ok: true, product: result.product, movement: result.movement, cashEntry, overview });
-    // La respuesta al operador sale primero. La sincronización LAN no debe mantener
-    // el botón esperando ni obligar a redibujar el formulario que conserva el foco.
-    setTimeout(() => {
-      try {
-        broadcastInventory(db, 'RESTOCK', {
-          productId: result.product.id,
-          product: result.product,
-          movement: result.movement,
-          idempotencyKey,
-          terminalCode: cashEntry.terminalCode
-        });
-      } catch (broadcastError) {
-        console.error('[RESTOCK] No se pudo sincronizar el inventario:', broadcastError.message || broadcastError);
-      }
-    }, 500);
+  }
+
+  const cashEntry = {
+    id: uuidv4(),
+    restockId,
+    inventoryMovementId: result.movement.id,
+    idempotencyKey,
+    folio: `RST-${String(restockSequence).padStart(6, '0')}`,
+    kind: 'restock_purchase',
+    sourceType,
+    dateKey,
+    productId: product.id,
+    productName: product.name,
+    quantity,
+    unit: product.unit || 'PZA',
+    unitCostSnapshot: unitCost,
+    totalCost,
+    accountingAmount: totalCost,
+    amountCashImpact: totalCost,
+    paymentMethod: 'cash',
+    paymentMethodLabel: 'Efectivo',
+    description: `Restock: ${product.name}`,
+    notes: String(request.notes || '').trim(),
+    terminalCode: String(request.terminalCode || (sourceType === 'REMOTE_ADMIN_RESTOCK' ? 'REMOTE-ADMIN' : 'ADMIN-01')).trim(),
+    branchId: getBranchProfile(db).code || 'LOCAL',
+    userId,
+    userName,
+    createdAt: now,
+    status: 'COMMITTED'
+  };
+  Object.assign(result.movement, {
+    restockId,
+    idempotencyKey,
+    unitCostSnapshot: unitCost,
+    totalCost,
+    cashEntryId: cashEntry.id,
+    dateKey,
+    status: 'COMMITTED'
+  });
+  db.cashEntries.push(cashEntry);
+  db.auditLog.unshift({
+    id: uuidv4(), action: 'RESTOCK_CASH_COMMITTED', restockId, idempotencyKey,
+    productId: product.id, productName: product.name, quantity, unit: product.unit || 'PZA',
+    unitCostSnapshot: unitCost, totalCost, inventoryMovementId: result.movement.id,
+    cashEntryId: cashEntry.id, branchId: cashEntry.branchId,
+    userId, userName, createdAt: now
+  });
+  db.auditLog = db.auditLog.slice(0, 10000);
+  writeDb(db);
+  const overview = {
+    ...overviewBefore,
+    expensesCashImpactTotal: round2(overviewBefore.expensesCashImpactTotal + cashEntry.amountCashImpact),
+    restockTotal: round2(overviewBefore.restockTotal + totalCost),
+    restockCashOutflowTotal: round2(overviewBefore.restockCashOutflowTotal + cashEntry.amountCashImpact),
+    restockPurchases: [...overviewBefore.restockPurchases, cashEntry],
+    accountingOutflowTotal: round2(overviewBefore.accountingOutflowTotal + totalCost),
+    expectedCash: round2(overviewBefore.expectedCash - cashEntry.amountCashImpact),
+    entries: [...overviewBefore.entries, cashEntry]
+  };
+  return { ok: true, alreadyRegistered: false, product: result.product, movement: result.movement, cashEntry, overview };
+}
+
+function broadcastRestockCommit(db, result, idempotencyKey, terminalCode) {
+  setTimeout(() => {
+    try {
+      broadcastInventory(db, 'RESTOCK', {
+        productId: result.product.id,
+        product: result.product,
+        movement: result.movement,
+        idempotencyKey,
+        terminalCode
+      });
+    } catch (broadcastError) {
+      console.error('[RESTOCK] No se pudo sincronizar el inventario:', broadcastError.message || broadcastError);
+    }
+  }, 500);
+}
+
+app.post('/api/products/restock', auth, requireAdmin, (req, res) => {
+  const db = req.dataDb13650 || readDb();
+  try {
+    const result = commitRestockTransaction(db, req.body || {}, {
+      sourceType: 'LOCAL_ADMIN_RESTOCK',
+      userId: req.user?.id || '',
+      userName: req.user?.name || req.user?.username || '',
+      actorName: req.user?.name || 'Administrador local',
+      actorUsername: req.user?.username || 'admin',
+      branchName: ADMIN_NAME
+    });
+    res.json(result);
+    if (!result.alreadyRegistered) broadcastRestockCommit(db, result, req.body?.idempotencyKey, result.cashEntry.terminalCode);
   } catch (err) {
-    res.status(400).json({ ok: false, message: err.message || 'No se pudo reabastecer el producto.' });
+    res.status(err.status || 400).json({ ok: false, code: err.code || '', message: err.message || 'No se pudo reabastecer el producto.' });
   }
 });
 
@@ -5894,6 +6105,52 @@ app.post('/api/branches/:id/inventory/adjust', auth, requireAdmin, async (req, r
   const branch = (db.branches || []).find((b) => b.id === req.params.id);
   if (!branch) return res.status(404).json({ ok: false, message: 'Sucursal no encontrada' });
   return res.status(403).json({ ok: false, message: 'El puente de sucursales es de solo consulta. Realiza los ajustes en la computadora de esa sucursal.' });
+});
+
+app.post('/api/branches/:id/inventory/restock', auth, requireAdmin, async (req, res) => {
+  const db = req.dataDb13650 || readDb();
+  const branch = (db.branches || []).find((entry) => entry.id === req.params.id);
+  if (!branch) return res.status(404).json({ ok: false, message: 'Sucursal no encontrada.' });
+
+  try {
+    const request = req.body || {};
+    const payload = {
+      productId: String(request.productId || ''),
+      quantity: request.quantity,
+      expectedUnitCost: request.expectedUnitCost,
+      idempotencyKey: String(request.idempotencyKey || ''),
+      reason: 'Reabastecimiento remoto desde sucursal principal',
+      notes: String(request.notes || ''),
+      terminalCode: String(request.terminalCode || 'REMOTE-ADMIN'),
+      actorName: String(req.user?.name || req.user?.username || 'Administrador de sucursal principal'),
+      actorUsername: String(req.user?.username || 'remote-admin'),
+      actorUserId: String(req.user?.id || ''),
+      actorBranch: String(getBranchProfile(db).name || ADMIN_NAME || 'Sucursal principal')
+    };
+    const result = await fetchRemoteBranch(branch, '/api/remote/inventory/restock', {
+      method: 'POST',
+      body: JSON.stringify(payload)
+    });
+    branch.lastStatus = 'ONLINE';
+    branch.lastCheckedAt = new Date().toISOString();
+    branch.lastError = '';
+    writeDb(db);
+    return res.json({ ok: true, branch: getBranchSummarySkeleton(branch), result });
+  } catch (err) {
+    const uncertain = !err.status || err.status === 504 || err.payload?.outcomeUnknown === true;
+    branch.lastStatus = err.status === 401 || err.status === 403 || err.status === 404 || err.status === 409 || err.status === 400 ? 'ONLINE' : 'OFFLINE';
+    branch.lastCheckedAt = new Date().toISOString();
+    branch.lastError = err.message || 'No se pudo confirmar el reabastecimiento remoto.';
+    writeDb(db);
+    return res.status(err.status || 502).json({
+      ok: false,
+      code: err.payload?.code || '',
+      outcomeUnknown: uncertain,
+      message: uncertain
+        ? `${err.message || 'No se confirmó la respuesta del puente.'} Si hubo demora, conserva la cantidad y vuelve a intentar la misma orden; el identificador evita duplicarla.`
+        : (err.message || 'No se pudo aplicar el reabastecimiento remoto.')
+    });
+  }
 });
 
 app.get('/api/branches/:id/session/connect', auth, requireAdmin, async (req, res) => {

@@ -1,6 +1,6 @@
 {
   "name": "cremeria-el-guero-pos-backend",
-  "version": "1.6.49",
+  "version": "1.6.51",
   "main": "server.js",
   "private": true,
   "scripts": {
@@ -16,7 +16,7 @@
     "uuid": "^11.1.0",
     "xlsx": "^0.18.5"
   },
-  "description": "Backend Cremería El Güero v1.6.49; puente de consulta en vivo por Render Free compatible con Windows 13.6.56 y Android 13.6.48/13.6.49.",
+  "description": "Backend Cremería El Güero v1.6.51; puente Render Free con reabastecimiento remoto en vivo, sin almacenamiento de negocio en Render.",
   "engines": {
     "node": ">=18"
   },
