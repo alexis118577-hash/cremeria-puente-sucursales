@@ -1,0 +1,17 @@
+services:
+  - type: web
+    runtime: node
+    name: cremeria-sucursales
+    plan: free
+    buildCommand: npm ci
+    startCommand: npm start
+    healthCheckPath: /health
+    envVars:
+      - key: ADMIN_NAME
+        value: Cremería El Güero - Puente en vivo de sucursales
+      - key: NODE_VERSION
+        value: "22"
+      - key: RENDER_MIRROR_ONLY
+        value: "true"
+      - key: REMOTE_API_KEY
+        generateValue: true
